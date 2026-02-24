@@ -1,0 +1,270 @@
+# =====================================================
+# 1. IMPORT LIBRARIES
+# =====================================================
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import optuna
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# =====================================================
+# 2. GENERATE MULTI-VARIATE TIME SERIES (600 STEPS)
+# =====================================================
+np.random.seed(42)
+T = 600
+t = np.arange(T)
+
+trend = 0.03 * t
+seasonality = 10 * np.sin(2 * np.pi * t / 50)
+noise = np.random.normal(0, 2, T)
+
+feature1 = trend + seasonality + noise
+feature2 = 5 * np.cos(2 * np.pi * t / 30) + np.random.normal(0,1,T)
+
+data = pd.DataFrame({
+    "target": feature1,
+    "exog1": feature2
+})
+
+data = data.interpolate()
+
+# =====================================================
+# 3. SCALING PIPELINE
+# =====================================================
+scaler = StandardScaler()
+data_scaled = scaler.fit_transform(data)
+
+# =====================================================
+# 4. CREATE WINDOW DATASET
+# =====================================================
+LOOKBACK = 30
+HORIZON = 7
+
+def create_windows(data, lookback, horizon):
+    X, y = [], []
+    for i in range(len(data) - lookback - horizon):
+        X.append(data[i:i+lookback])
+        y.append(data[i+lookback:i+lookback+horizon, 0])
+    return np.array(X), np.array(y)
+
+X, y = create_windows(data_scaled, LOOKBACK, HORIZON)
+
+# =====================================================
+# 5. CUSTOM DATASET
+# =====================================================
+class TimeSeriesDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+# =====================================================
+# 6. N-BEATS MODEL (MULTIVARIATE)
+# =====================================================
+class NBeatsBlock(nn.Module):
+    def __init__(self, input_size, theta_size, horizon, hidden):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_size, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, theta_size)
+        )
+        self.backcast = nn.Linear(theta_size, input_size)
+        self.forecast = nn.Linear(theta_size, horizon)
+
+    def forward(self, x):
+        theta = self.fc(x)
+        return self.backcast(theta), self.forecast(theta)
+
+class NBeats(nn.Module):
+    def __init__(self, input_size, horizon, stacks, hidden):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            NBeatsBlock(input_size, 128, horizon, hidden)
+            for _ in range(stacks)
+        ])
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        residual = x
+        forecast = torch.zeros(x.size(0), HORIZON).to(device)
+
+        for block in self.blocks:
+            backcast, block_forecast = block(residual)
+            residual = residual - backcast
+            forecast = forecast + block_forecast
+
+        return forecast
+
+# =====================================================
+# 7. ROLLING CROSS VALIDATION
+# =====================================================
+def rolling_cv(X, y, splits=3):
+    fold_size = len(X) // (splits + 1)
+    indices = []
+
+    for i in range(splits):
+        train_end = fold_size * (i+1)
+        val_end = train_end + fold_size
+        indices.append((0, train_end, train_end, val_end))
+    return indices
+
+# =====================================================
+# 8. METRICS
+# =====================================================
+def mase(y_true, y_pred, training_series):
+    naive = np.mean(np.abs(training_series[1:] - training_series[:-1]))
+    return np.mean(np.abs(y_true - y_pred)) / naive
+
+# =====================================================
+# 9. HYPERPARAMETER TUNING (OPTUNA)
+# =====================================================
+def objective(trial):
+
+    stacks = trial.suggest_int("stacks", 2, 4)
+    hidden = trial.suggest_int("hidden", 64, 256)
+    lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+
+    cv_indices = rolling_cv(X, y)
+    losses = []
+
+    for start_tr, end_tr, start_val, end_val in cv_indices:
+
+        train_data = TimeSeriesDataset(X[start_tr:end_tr], y[start_tr:end_tr])
+        val_data = TimeSeriesDataset(X[start_val:end_val], y[start_val:end_val])
+
+        train_loader = DataLoader(train_data, batch_size=32, shuffle=False)
+        val_loader = DataLoader(val_data, batch_size=32, shuffle=False)
+
+        model = NBeats(
+            input_size=LOOKBACK*2,
+            horizon=HORIZON,
+            stacks=stacks,
+            hidden=hidden
+        ).to(device)
+
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.MSELoss()
+
+        for epoch in range(20):
+            model.train()
+            for xb, yb in train_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                optimizer.zero_grad()
+                loss = criterion(model(xb), yb)
+                loss.backward()
+                optimizer.step()
+
+        model.eval()
+        val_preds = []
+        val_true = []
+
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                preds = model(xb)
+                val_preds.append(preds.cpu().numpy())
+                val_true.append(yb.numpy())
+
+        val_preds = np.vstack(val_preds)
+        val_true = np.vstack(val_true)
+
+        rmse = np.sqrt(mean_squared_error(val_true.flatten(), val_preds.flatten()))
+        losses.append(rmse)
+
+    return np.mean(losses)
+
+study = optuna.create_study(direction="minimize")
+study.optimize(objective, n_trials=10)
+
+print("Best Params:", study.best_params)
+
+# =====================================================
+# 10. TRAIN FINAL MODEL
+# =====================================================
+best_params = study.best_params
+
+model = NBeats(
+    input_size=LOOKBACK*2,
+    horizon=HORIZON,
+    stacks=best_params["stacks"],
+    hidden=best_params["hidden"]
+).to(device)
+
+optimizer = optim.Adam(model.parameters(), lr=best_params["lr"])
+criterion = nn.MSELoss()
+
+dataset = TimeSeriesDataset(X, y)
+loader = DataLoader(dataset, batch_size=32, shuffle=False)
+
+for epoch in range(50):
+    model.train()
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        optimizer.zero_grad()
+        loss = criterion(model(xb), yb)
+        loss.backward()
+        optimizer.step()
+
+# =====================================================
+# 11. EVALUATION
+# =====================================================
+model.eval()
+preds = model(torch.tensor(X, dtype=torch.float32).to(device)).cpu().detach().numpy()
+
+mae = mean_absolute_error(y.flatten(), preds.flatten())
+rmse = np.sqrt(mean_squared_error(y.flatten(), preds.flatten()))
+mase_score = mase(y.flatten(), preds.flatten(), data["target"].values)
+
+print("\nFinal Performance:")
+print("MAE:", mae)
+print("RMSE:", rmse)
+print("MASE:", mase_score)
+
+# =====================================================
+# 12. EXPLAINABILITY (PERMUTATION IMPORTANCE)
+# =====================================================
+def permutation_importance(model, X, y):
+    baseline = mean_squared_error(y.flatten(), model(
+        torch.tensor(X, dtype=torch.float32).to(device)
+    ).cpu().detach().numpy().flatten())
+
+    importances = []
+
+    for feature in range(X.shape[2]):
+        X_perm = X.copy()
+        np.random.shuffle(X_perm[:,:,feature])
+        perm_pred = model(torch.tensor(X_perm, dtype=torch.float32).to(device))
+        perm_pred = perm_pred.cpu().detach().numpy()
+
+        loss = mean_squared_error(y.flatten(), perm_pred.flatten())
+        importances.append(loss - baseline)
+
+    return importances
+
+importance = permutation_importance(model, X, y)
+
+plt.bar(["target_lags","exog1_lags"], importance)
+plt.title("Feature Importance")
+plt.show()
+
+# =====================================================
+# 13. SAVE MODEL (DEPLOYMENT READY)
+# =====================================================
+torch.save(model.state_dict(), "nbeats_model.pth")
